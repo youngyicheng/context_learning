@@ -1,5 +1,6 @@
 """REINFORCE-style trainer for Solver (and optionally Challenge) model."""
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -10,6 +11,8 @@ from ..env.clbench_env import CLBenchEnv
 from ..models.challenge_model import ChallengeModel
 from ..models.solver_model import SolverModel
 from ..rewards.rubrics_reward import RubricsReward
+
+logger = logging.getLogger(__name__)
 
 
 class ReinforceTrainer:
@@ -25,13 +28,6 @@ class ReinforceTrainer:
         solver_model: Optional[SolverModel] = None,
         reward_fn: Optional[RubricsReward] = None,
     ):
-        """
-        Args:
-            config: Training config (merged with defaults).
-            challenge_model: Pre-initialized Challenge model (or created from config).
-            solver_model: Pre-initialized Solver model (or created from config).
-            reward_fn: Pre-initialized reward (or created from config).
-        """
         from ..config.default_config import merge_config
 
         self.config = merge_config(config)
@@ -73,7 +69,14 @@ class ReinforceTrainer:
             use_llm_judge=rw.get("use_llm_judge", False),
             judge_model=rw.get("judge_model", "gpt-4"),
             api_client=None,
-            challenge_reward_scale=rw.get("challenge_reward_scale", 1.0),
+            challenge_correctness_weight=rw.get("challenge_correctness_weight", 1.0),
+            repetition_penalty_weight=rw.get("repetition_penalty_weight", 0.3),
+            format_penalty_weight=rw.get("format_penalty_weight", 0.2),
+            relevance_weight=rw.get("relevance_weight", 0.3),
+            rubric_quality_weight=rw.get("rubric_quality_weight", 0.2),
+            solver_correctness_weight=rw.get("solver_correctness_weight", 1.0),
+            context_grounding_weight=rw.get("context_grounding_weight", 0.3),
+            tool_usage_weight=rw.get("tool_usage_weight", 0.2),
         )
 
     def _create_dataloader(self) -> CLBenchDataLoader:
@@ -96,6 +99,8 @@ class ReinforceTrainer:
         out = {
             "solver_reward": step.solver_reward,
             "challenge_reward": step.challenge_reward,
+            "solver_breakdown": step.solver_reward_breakdown,
+            "challenge_breakdown": step.challenge_reward_breakdown,
             "answer": step.answer,
             "metadata": step.metadata,
         }
@@ -106,19 +111,21 @@ class ReinforceTrainer:
     def train(self) -> Dict[str, float]:
         """
         Run training loop: iterate data, run episodes, optionally update models.
-        For MVP, only collects rewards; gradient updates can be added via TRL later.
+        Collects multi-component rewards and logs detailed breakdowns.
         """
         loader = self._create_dataloader()
         loader.load()
 
         train_cfg = self.cfg.get("training", {})
-        train_solver = train_cfg.get("train_solver", True)
-        train_challenge = train_cfg.get("train_challenge", False)
         log_every = train_cfg.get("log_every", 5)
         save_every = train_cfg.get("save_every", 100)
 
         total_solver_r = 0.0
         total_challenge_r = 0.0
+        total_solver_correctness = 0.0
+        total_solver_grounding = 0.0
+        total_challenge_correctness = 0.0
+        total_challenge_repetition = 0.0
         n = 0
         samples = list(loader)
         iterator = tqdm(samples, desc="Training")
@@ -131,12 +138,23 @@ class ReinforceTrainer:
             total_challenge_r += r_c
             n += 1
 
+            s_bd = result.get("solver_breakdown")
+            c_bd = result.get("challenge_breakdown")
+            if s_bd:
+                total_solver_correctness += s_bd.correctness
+                total_solver_grounding += s_bd.context_grounding
+            if c_bd:
+                total_challenge_correctness += c_bd.correctness
+                total_challenge_repetition += c_bd.repetition_penalty
+
             if (i + 1) % log_every == 0:
                 avg_s = total_solver_r / n
                 avg_c = total_challenge_r / n
                 iterator.set_postfix(
                     solver_r=round(avg_s, 4),
                     challenge_r=round(avg_c, 4),
+                    s_correct=round(total_solver_correctness / n, 4),
+                    s_ground=round(total_solver_grounding / n, 4),
                 )
 
             if save_every and (i + 1) % save_every == 0:
@@ -145,8 +163,13 @@ class ReinforceTrainer:
         metrics = {
             "mean_solver_reward": total_solver_r / n if n else 0.0,
             "mean_challenge_reward": total_challenge_r / n if n else 0.0,
+            "mean_solver_correctness": total_solver_correctness / n if n else 0.0,
+            "mean_solver_grounding": total_solver_grounding / n if n else 0.0,
+            "mean_challenge_correctness": total_challenge_correctness / n if n else 0.0,
+            "mean_challenge_repetition_penalty": total_challenge_repetition / n if n else 0.0,
             "num_episodes": n,
         }
+        logger.info("Training complete. Metrics: %s", metrics)
         return metrics
 
     def _save_checkpoint(self, step: int) -> None:

@@ -1,8 +1,9 @@
 """Solver model (Student) wrapper for generating answers from context."""
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -41,68 +42,108 @@ class SolverModel:
         max_new_tokens: int = 2048,
         temperature: float = 0.7,
         do_sample: bool = True,
-        return_logprobs: bool = False,
         **kwargs,
-    ):
+    ) -> str:
         """
-        Generate answer given context and question (in messages).
+        Generate answer (inference only, no gradient).
 
         Args:
             messages: OpenAI chat format [{"role": "system", "content": "..."}, ...].
             max_new_tokens: Max tokens to generate.
             temperature: Sampling temperature.
             do_sample: Whether to sample.
-            return_logprobs: Whether to return token log-probs (for RL).
-            **kwargs: Additional generation kwargs.
 
         Returns:
-            If return_logprobs: (response_text, logprobs_tensor).
-            Else: response_text.
+            Generated response text.
         """
         prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+            messages, tokenize=False, add_generation_prompt=True,
         )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-            "do_sample": do_sample,
-            "pad_token_id": self.tokenizer.eos_token_id,
-            **kwargs,
-        }
-        if return_logprobs:
-            gen_kwargs["output_scores"] = True
-            gen_kwargs["return_dict_in_generate"] = True
-
-        with torch.set_grad_enabled(return_logprobs):
-            outputs = self.model.generate(**inputs, **gen_kwargs)
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=do_sample,
+                pad_token_id=self.tokenizer.eos_token_id,
+                **kwargs,
+            )
 
         input_len = inputs["input_ids"].shape[1]
-        if return_logprobs:
-            gen_ids = outputs.sequences[0][input_len:]
-            response = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
-            logprobs = self._get_sequence_logprobs(outputs, input_len)
-            return response.strip(), logprobs
-        else:
-            response = self.tokenizer.decode(
-                outputs[0][input_len:], skip_special_tokens=True
-            )
-            return response.strip()
+        response = self.tokenizer.decode(
+            outputs[0][input_len:], skip_special_tokens=True
+        )
+        return response.strip()
 
-    def _get_sequence_logprobs(self, outputs, input_len: int) -> torch.Tensor:
-        """Compute per-token log-probs for generated sequence (for REINFORCE)."""
-        scores = outputs.scores
-        if not scores:
-            return torch.tensor(0.0, device=self.model.device)
-        gen_ids = outputs.sequences[0][input_len:]
-        logprobs = []
-        for t, token_id in enumerate(gen_ids):
-            if t < len(scores):
-                logits = scores[t][0]
-                logp = torch.log_softmax(logits.float(), dim=-1)
-                lp = logp[token_id].item()
-                logprobs.append(lp)
-        return torch.tensor(logprobs, device=self.model.device)
+    def generate_for_rl(
+        self,
+        messages: List[dict],
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        **kwargs,
+    ) -> Tuple[str, torch.Tensor, torch.Tensor]:
+        """
+        Generate answer and return token IDs for subsequent differentiable
+        log-prob computation (REINFORCE). Generation itself is non-differentiable.
+
+        Args:
+            messages: OpenAI chat format messages.
+            max_new_tokens: Max tokens to generate.
+            temperature: Sampling temperature.
+            do_sample: Whether to sample.
+
+        Returns:
+            (response_text, input_ids [1, prompt_len], generated_ids [1, gen_len])
+        """
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_ids = inputs["input_ids"]
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=do_sample,
+                pad_token_id=self.tokenizer.eos_token_id,
+                **kwargs,
+            )
+
+        input_len = input_ids.shape[1]
+        generated_ids = outputs[:1, input_len:]
+        response = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        return response.strip(), input_ids.detach(), generated_ids.detach()
+
+    def compute_sequence_logprob(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Differentiable forward pass to compute mean log-probability of the
+        generated sequence, suitable for REINFORCE policy gradient.
+
+        Args:
+            input_ids: Prompt token IDs, shape [1, prompt_len].
+            generated_ids: Generated token IDs, shape [1, gen_len].
+
+        Returns:
+            Scalar tensor: mean log P(generated | prompt), with gradient.
+        """
+        if generated_ids.numel() == 0:
+            return torch.tensor(0.0, device=self.model.device, requires_grad=True)
+
+        full_ids = torch.cat([input_ids, generated_ids], dim=1)
+        outputs = self.model(full_ids)
+        logits = outputs.logits.float()
+
+        input_len = input_ids.shape[1]
+        shift_logits = logits[:, input_len - 1:-1, :]
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
+        return token_log_probs.mean(dim=-1).squeeze(0)

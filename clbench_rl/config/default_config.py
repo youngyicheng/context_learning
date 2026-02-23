@@ -27,7 +27,16 @@ def get_default_config() -> Dict[str, Any]:
         "reward": {
             "use_llm_judge": False,
             "judge_model": "gpt-4",
-            "challenge_reward_scale": 1.0,
+            # Challenge reward component weights
+            "challenge_correctness_weight": 1.0,
+            "repetition_penalty_weight": 0.3,
+            "format_penalty_weight": 0.2,
+            "relevance_weight": 0.3,
+            "rubric_quality_weight": 0.2,
+            # Solver reward component weights
+            "solver_correctness_weight": 1.0,
+            "context_grounding_weight": 0.3,
+            "tool_usage_weight": 0.2,
         },
         "training": {
             "train_solver": True,

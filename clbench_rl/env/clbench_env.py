@@ -1,11 +1,11 @@
 """RL environment encapsulating sample -> Challenge -> Solver -> Scoring."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ..models.challenge_model import ChallengeModel
 from ..models.solver_model import SolverModel
-from ..rewards.base_reward import BaseReward
+from ..rewards.base_reward import BaseReward, ChallengeRewardResult, SolverRewardResult
 
 
 @dataclass
@@ -14,11 +14,13 @@ class EnvStep:
 
     solver_reward: float
     challenge_reward: float
-    answer: str
-    challenge_output: Optional[str]
-    messages: List[dict]
-    rubrics: List[str]
-    metadata: Dict[str, Any]
+    solver_reward_breakdown: Optional[SolverRewardResult] = None
+    challenge_reward_breakdown: Optional[ChallengeRewardResult] = None
+    answer: str = ""
+    challenge_output: Optional[str] = None
+    messages: List[dict] = field(default_factory=list)
+    rubrics: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class CLBenchEnv:
@@ -33,13 +35,6 @@ class CLBenchEnv:
         reward_fn: BaseReward,
         challenge_pass_through: bool = True,
     ):
-        """
-        Args:
-            challenge_model: Teacher model (can transform or pass through context).
-            solver_model: Student model that generates answers.
-            reward_fn: Computes solver and challenge rewards.
-            challenge_pass_through: If True, skip Challenge generation and use raw messages.
-        """
         self.challenge_model = challenge_model
         self.solver_model = solver_model
         self.reward_fn = reward_fn
@@ -96,26 +91,34 @@ class CLBenchEnv:
             answer = self.solver_model.generate(solver_messages)
 
         context_str = self._extract_context(solver_messages)
+        question_str = self._extract_question(solver_messages)
 
-        solver_reward = self.reward_fn.compute_solver_reward(
+        # --- Solver reward (multi-component) ---
+        solver_result = self.reward_fn.compute_solver_reward(
             answer=answer,
             rubrics=rubrics,
+            context=context_str,
             metadata=metadata,
             challenge_output=challenge_output,
             messages=messages,
         )
 
-        challenge_reward = self.reward_fn.compute_challenge_reward(
-            solver_reward=solver_reward,
+        # --- Challenge reward (multi-component, adversarial) ---
+        challenge_result = self.reward_fn.compute_challenge_reward(
+            solver_correctness=solver_result.correctness,
+            challenge_output=challenge_output or context_str,
             context=context_str,
+            question=question_str,
+            rubrics=rubrics,
             metadata=metadata,
             answer=answer,
-            rubrics=rubrics,
         )
 
         return EnvStep(
-            solver_reward=solver_reward,
-            challenge_reward=challenge_reward,
+            solver_reward=solver_result.total,
+            challenge_reward=challenge_result.total,
+            solver_reward_breakdown=solver_result,
+            challenge_reward_breakdown=challenge_result,
             answer=answer,
             challenge_output=challenge_output,
             messages=messages,
@@ -130,3 +133,10 @@ class CLBenchEnv:
             if isinstance(m, dict) and m.get("content"):
                 parts.append(m["content"])
         return "\n".join(parts)
+
+    def _extract_question(self, messages: List[dict]) -> str:
+        """Extract the user question from the last user message."""
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user":
+                return m.get("content", "")
+        return ""
