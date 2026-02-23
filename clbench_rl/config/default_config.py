@@ -51,6 +51,14 @@ def get_default_config() -> Dict[str, Any]:
             "save_every": 100,
             "log_every": 5,
         },
+        "grpo": {
+            "group_size": 4,
+            "clip_eps": 0.2,
+            "kl_beta": 0.04,
+            "adv_eps": 1e-8,
+            "max_grad_norm": 1.0,
+            "mu_iterations": 1,
+        },
     }
 
 

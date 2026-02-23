@@ -121,7 +121,7 @@ class SolverModel:
     ) -> Tuple[str, torch.Tensor, torch.Tensor]:
         """
         Generate answer and return token IDs for subsequent differentiable
-        log-prob computation (REINFORCE). Generation itself is non-differentiable.
+        log-prob computation. Generation itself is non-differentiable.
 
         Args:
             messages: OpenAI chat format messages.
@@ -154,6 +154,55 @@ class SolverModel:
         response = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         return response.strip(), input_ids.detach(), generated_ids.detach()
 
+    def generate_group(
+        self,
+        messages: List[dict],
+        group_size: int = 4,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> List[Tuple[str, torch.Tensor, torch.Tensor]]:
+        """
+        Generate a group of G responses for the same prompt (GRPO sampling).
+
+        Each response is sampled independently. Returns G tuples of
+        (response_text, input_ids, generated_ids) for subsequent log-prob
+        computation and policy gradient.
+
+        Args:
+            messages: OpenAI chat format messages.
+            group_size: Number of responses G to sample per prompt.
+            max_new_tokens: Max tokens to generate per response.
+            temperature: Sampling temperature.
+
+        Returns:
+            List of G tuples: [(text, input_ids, generated_ids), ...]
+        """
+        messages = self._ensure_system_prompt(messages)
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        input_ids = inputs["input_ids"]
+
+        results = []
+        with torch.no_grad():
+            for _ in range(group_size):
+                outputs = self.model.generate(
+                    **{k: v.clone() for k, v in inputs.items()},
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    **kwargs,
+                )
+                input_len = input_ids.shape[1]
+                gen_ids = outputs[:1, input_len:]
+                text = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+                results.append((text.strip(), input_ids.detach(), gen_ids.detach()))
+
+        return results
+
     def compute_sequence_logprob(
         self,
         input_ids: torch.Tensor,
@@ -161,7 +210,7 @@ class SolverModel:
     ) -> torch.Tensor:
         """
         Differentiable forward pass to compute mean log-probability of the
-        generated sequence, suitable for REINFORCE policy gradient.
+        generated sequence, suitable for policy gradient.
 
         Args:
             input_ids: Prompt token IDs, shape [1, prompt_len].
@@ -182,6 +231,63 @@ class SolverModel:
         log_probs = F.log_softmax(shift_logits, dim=-1)
         token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.mean(dim=-1).squeeze(0)
+
+    def compute_per_token_logprobs(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Differentiable forward pass returning per-token log-probabilities.
+
+        Args:
+            input_ids: Prompt token IDs, shape [1, prompt_len].
+            generated_ids: Generated token IDs, shape [1, gen_len].
+
+        Returns:
+            Tensor of shape [gen_len] with per-token log P, with gradient.
+        """
+        if generated_ids.numel() == 0:
+            return torch.zeros(0, device=self.model.device, requires_grad=True)
+
+        full_ids = torch.cat([input_ids, generated_ids], dim=1)
+        outputs = self.model(full_ids)
+        logits = outputs.logits.float()
+
+        input_len = input_ids.shape[1]
+        shift_logits = logits[:, input_len - 1:-1, :]
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
+        return token_log_probs.squeeze(0)
+
+    @torch.no_grad()
+    def compute_per_token_logprobs_detached(
+        self,
+        input_ids: torch.Tensor,
+        generated_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Non-differentiable per-token log-probs (for old policy / reference model).
+
+        Args:
+            input_ids: Prompt token IDs, shape [1, prompt_len].
+            generated_ids: Generated token IDs, shape [1, gen_len].
+
+        Returns:
+            Tensor of shape [gen_len] with per-token log P, detached.
+        """
+        if generated_ids.numel() == 0:
+            return torch.zeros(0, device=self.model.device)
+
+        full_ids = torch.cat([input_ids, generated_ids], dim=1)
+        outputs = self.model(full_ids)
+        logits = outputs.logits.float()
+
+        input_len = input_ids.shape[1]
+        shift_logits = logits[:, input_len - 1:-1, :]
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
+        return token_log_probs.squeeze(0)
 
     def _ensure_system_prompt(self, messages: List[dict]) -> List[dict]:
         """Inject solver system prompt if no system message is present."""
