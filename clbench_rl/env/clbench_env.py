@@ -44,6 +44,7 @@ class CLBenchEnv:
         self,
         sample: Dict[str, Any],
         return_logprobs: bool = False,
+        batch_repetition_penalty: Optional[float] = None,
     ) -> EnvStep:
         """
         Run one episode: get messages from sample -> Solver answers -> compute rewards.
@@ -51,6 +52,8 @@ class CLBenchEnv:
         Args:
             sample: Dict with 'messages', 'rubrics', 'metadata'.
             return_logprobs: If True, Solver returns (answer, logprobs) for RL training.
+            batch_repetition_penalty: Pre-computed BLEU-clustering penalty (B.4)
+                from the trainer. If provided, overrides single-text penalty.
 
         Returns:
             EnvStep with rewards, answer, and context. logprobs stored in metadata if requested.
@@ -104,6 +107,10 @@ class CLBenchEnv:
         )
 
         # --- Challenge reward (multi-component, adversarial) ---
+        challenge_kwargs: Dict[str, Any] = {"answer": answer}
+        if batch_repetition_penalty is not None:
+            challenge_kwargs["batch_repetition_penalty"] = batch_repetition_penalty
+
         challenge_result = self.reward_fn.compute_challenge_reward(
             solver_correctness=solver_result.correctness,
             challenge_output=challenge_output or context_str,
@@ -111,7 +118,7 @@ class CLBenchEnv:
             question=question_str,
             rubrics=rubrics,
             metadata=metadata,
-            answer=answer,
+            **challenge_kwargs,
         )
 
         return EnvStep(

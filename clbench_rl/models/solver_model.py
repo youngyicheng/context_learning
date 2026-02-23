@@ -6,6 +6,13 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+SOLVER_SYSTEM_PROMPT = (
+    "You are given a context and a question. Read the context carefully, "
+    "reason step by step, and provide a clear, well-supported answer. "
+    "Base your answer strictly on the information in the context. "
+    "Wrap your final answer in <answer>...</answer> tags."
+)
+
 
 class SolverModel:
     """Solver model that answers questions based on provided context."""
@@ -15,15 +22,18 @@ class SolverModel:
         model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
         device: Optional[str] = None,
         use_fast: bool = True,
+        system_prompt: Optional[str] = None,
     ):
         """
         Args:
             model_name: HuggingFace model identifier.
             device: Device to load model on (None = auto).
             use_fast: Use fast tokenizer.
+            system_prompt: Custom system prompt (defaults to SOLVER_SYSTEM_PROMPT).
         """
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.system_prompt = system_prompt or SOLVER_SYSTEM_PROMPT
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True, use_fast=use_fast
         )
@@ -36,6 +46,27 @@ class SolverModel:
         if self.device == "cpu":
             self.model = self.model.to(self.device)
 
+    def build_solver_messages(
+        self, question: str, context: str = ""
+    ) -> List[dict]:
+        """
+        Build solver messages with system prompt, context, and question.
+
+        Args:
+            question: The question to answer.
+            context: Optional context passage to ground the answer in.
+
+        Returns:
+            Messages in OpenAI chat format with system + user roles.
+        """
+        user_content = question
+        if context:
+            user_content = f"Context:\n{context}\n\nQuestion:\n{question}"
+        return [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
     def generate(
         self,
         messages: List[dict],
@@ -47,6 +78,8 @@ class SolverModel:
         """
         Generate answer (inference only, no gradient).
 
+        Automatically injects solver system prompt if no system message is present.
+
         Args:
             messages: OpenAI chat format [{"role": "system", "content": "..."}, ...].
             max_new_tokens: Max tokens to generate.
@@ -56,6 +89,7 @@ class SolverModel:
         Returns:
             Generated response text.
         """
+        messages = self._ensure_system_prompt(messages)
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
@@ -98,6 +132,7 @@ class SolverModel:
         Returns:
             (response_text, input_ids [1, prompt_len], generated_ids [1, gen_len])
         """
+        messages = self._ensure_system_prompt(messages)
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
@@ -147,3 +182,10 @@ class SolverModel:
         log_probs = F.log_softmax(shift_logits, dim=-1)
         token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.mean(dim=-1).squeeze(0)
+
+    def _ensure_system_prompt(self, messages: List[dict]) -> List[dict]:
+        """Inject solver system prompt if no system message is present."""
+        has_system = any(m.get("role") == "system" for m in messages)
+        if has_system:
+            return messages
+        return [{"role": "system", "content": self.system_prompt}] + messages

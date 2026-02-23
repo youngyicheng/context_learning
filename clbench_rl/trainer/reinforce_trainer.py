@@ -1,8 +1,11 @@
-"""REINFORCE-style trainer for Solver (and optionally Challenge) model."""
+"""REINFORCE-style trainer for Solver (and optionally Challenge) model.
+
+Implements batch-level BLEU-clustering repetition penalty (Appendix B.4).
+"""
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from tqdm import tqdm
 
@@ -18,7 +21,9 @@ logger = logging.getLogger(__name__)
 class ReinforceTrainer:
     """
     Trainer that runs pipeline: load data -> env.step -> accumulate rewards -> update.
+
     Uses REINFORCE for Solver (and optionally Challenge) with policy gradient.
+    Applies batch-level BLEU-clustering repetition penalty per Appendix B.4.
     """
 
     def __init__(
@@ -49,6 +54,9 @@ class ReinforceTrainer:
         )
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        rw_cfg = self.cfg.get("reward", {})
+        self.repetition_batch_size = rw_cfg.get("repetition_batch_size", 16)
+
     def _create_challenge_model(self) -> ChallengeModel:
         cm = self.cfg.get("challenge_model", {})
         return ChallengeModel(
@@ -67,7 +75,8 @@ class ReinforceTrainer:
         rw = self.cfg.get("reward", {})
         return RubricsReward(
             use_llm_judge=rw.get("use_llm_judge", False),
-            judge_model=rw.get("judge_model", "gpt-4"),
+            judge_model=rw.get("judge_model", "gpt-4o"),
+            judge_temperature=rw.get("judge_temperature", 0.1),
             api_client=None,
             challenge_correctness_weight=rw.get("challenge_correctness_weight", 1.0),
             repetition_penalty_weight=rw.get("repetition_penalty_weight", 0.3),
@@ -77,6 +86,7 @@ class ReinforceTrainer:
             solver_correctness_weight=rw.get("solver_correctness_weight", 1.0),
             context_grounding_weight=rw.get("context_grounding_weight", 0.3),
             tool_usage_weight=rw.get("tool_usage_weight", 0.2),
+            bleu_distance_threshold=rw.get("bleu_distance_threshold", 0.5),
         )
 
     def _create_dataloader(self) -> CLBenchDataLoader:
@@ -93,25 +103,43 @@ class ReinforceTrainer:
         self,
         sample: Dict[str, Any],
         return_logprobs: bool = False,
+        batch_repetition_penalty: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Run one episode and return step result with rewards."""
-        step = self.env.step(sample, return_logprobs=return_logprobs)
+        step = self.env.step(
+            sample,
+            return_logprobs=return_logprobs,
+            batch_repetition_penalty=batch_repetition_penalty,
+        )
         out = {
             "solver_reward": step.solver_reward,
             "challenge_reward": step.challenge_reward,
             "solver_breakdown": step.solver_reward_breakdown,
             "challenge_breakdown": step.challenge_reward_breakdown,
             "answer": step.answer,
+            "challenge_output": step.challenge_output,
             "metadata": step.metadata,
         }
         if "_logprobs" in step.metadata:
             out["logprobs"] = step.metadata.pop("_logprobs", None)
         return out
 
+    def _extract_question_from_sample(self, sample: Dict[str, Any]) -> str:
+        """Extract the question text from a sample for batch repetition computation."""
+        messages = sample.get("messages", [])
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user":
+                return m.get("content", "")
+        return ""
+
     def train(self) -> Dict[str, float]:
         """
-        Run training loop: iterate data, run episodes, optionally update models.
-        Collects multi-component rewards and logs detailed breakdowns.
+        Run training loop with batch-level BLEU repetition penalty (B.4).
+
+        Processes samples in batches of `repetition_batch_size`. For each batch:
+            1. Extract questions from all samples
+            2. Compute BLEU-clustering penalties: r_rep(x_i) = |C_k| / B
+            3. Run episodes with per-sample repetition penalties injected
         """
         loader = self._create_dataloader()
         loader.load()
@@ -128,37 +156,53 @@ class ReinforceTrainer:
         total_challenge_repetition = 0.0
         n = 0
         samples = list(loader)
-        iterator = tqdm(samples, desc="Training")
 
-        for i, sample in enumerate(iterator):
-            result = self.run_episode(sample, return_logprobs=False)
-            r_s = result["solver_reward"]
-            r_c = result["challenge_reward"]
-            total_solver_r += r_s
-            total_challenge_r += r_c
-            n += 1
+        batches = self._chunk_samples(samples, self.repetition_batch_size)
+        flat_idx = 0
+        iterator = tqdm(total=len(samples), desc="Training")
 
-            s_bd = result.get("solver_breakdown")
-            c_bd = result.get("challenge_breakdown")
-            if s_bd:
-                total_solver_correctness += s_bd.correctness
-                total_solver_grounding += s_bd.context_grounding
-            if c_bd:
-                total_challenge_correctness += c_bd.correctness
-                total_challenge_repetition += c_bd.repetition_penalty
+        for batch in batches:
+            questions = [self._extract_question_from_sample(s) for s in batch]
+            rep_penalties = self.reward_fn.compute_batch_repetition(questions)
 
-            if (i + 1) % log_every == 0:
-                avg_s = total_solver_r / n
-                avg_c = total_challenge_r / n
-                iterator.set_postfix(
-                    solver_r=round(avg_s, 4),
-                    challenge_r=round(avg_c, 4),
-                    s_correct=round(total_solver_correctness / n, 4),
-                    s_ground=round(total_solver_grounding / n, 4),
+            for j, sample in enumerate(batch):
+                result = self.run_episode(
+                    sample,
+                    return_logprobs=False,
+                    batch_repetition_penalty=rep_penalties[j],
                 )
+                r_s = result["solver_reward"]
+                r_c = result["challenge_reward"]
+                total_solver_r += r_s
+                total_challenge_r += r_c
+                n += 1
 
-            if save_every and (i + 1) % save_every == 0:
-                self._save_checkpoint(i + 1)
+                s_bd = result.get("solver_breakdown")
+                c_bd = result.get("challenge_breakdown")
+                if s_bd:
+                    total_solver_correctness += s_bd.correctness
+                    total_solver_grounding += s_bd.context_grounding
+                if c_bd:
+                    total_challenge_correctness += c_bd.correctness
+                    total_challenge_repetition += c_bd.repetition_penalty
+
+                flat_idx += 1
+                iterator.update(1)
+
+                if flat_idx % log_every == 0:
+                    avg_s = total_solver_r / n
+                    avg_c = total_challenge_r / n
+                    iterator.set_postfix(
+                        solver_r=round(avg_s, 4),
+                        challenge_r=round(avg_c, 4),
+                        s_correct=round(total_solver_correctness / n, 4),
+                        rep_pen=round(total_challenge_repetition / n, 4),
+                    )
+
+                if save_every and flat_idx % save_every == 0:
+                    self._save_checkpoint(flat_idx)
+
+        iterator.close()
 
         metrics = {
             "mean_solver_reward": total_solver_r / n if n else 0.0,
@@ -171,6 +215,17 @@ class ReinforceTrainer:
         }
         logger.info("Training complete. Metrics: %s", metrics)
         return metrics
+
+    @staticmethod
+    def _chunk_samples(
+        samples: List[Dict[str, Any]],
+        batch_size: int,
+    ) -> List[List[Dict[str, Any]]]:
+        """Split samples into batches for batch-level repetition penalty."""
+        return [
+            samples[i : i + batch_size]
+            for i in range(0, len(samples), batch_size)
+        ]
 
     def _save_checkpoint(self, step: int) -> None:
         """Save model checkpoints."""

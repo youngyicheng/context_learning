@@ -26,7 +26,8 @@ def get_default_config() -> Dict[str, Any]:
         },
         "reward": {
             "use_llm_judge": False,
-            "judge_model": "gpt-4",
+            "judge_model": "gpt-4o",
+            "judge_temperature": 0.1,
             # Challenge reward component weights
             "challenge_correctness_weight": 1.0,
             "repetition_penalty_weight": 0.3,
@@ -37,6 +38,9 @@ def get_default_config() -> Dict[str, Any]:
             "solver_correctness_weight": 1.0,
             "context_grounding_weight": 0.3,
             "tool_usage_weight": 0.2,
+            # BLEU-clustering repetition penalty (B.4)
+            "bleu_distance_threshold": 0.5,
+            "repetition_batch_size": 16,
         },
         "training": {
             "train_solver": True,
