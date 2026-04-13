@@ -22,12 +22,15 @@ export NCCL_IB_DISABLE=0
 export TOKENIZERS_PARALLELISM=false
 export WANDB_DISABLED=true  # set to false if you want W&B logging
 
-# Judge LLM (paper: frozen evaluator, default GPT-4o)
-# Set your API key here or in your shell profile:
+# Judge LLM (paper: frozen evaluator, default gpt-4o-mini)
+# Set your API key here, in .env, or in your shell profile:
 #   export OPENAI_API_KEY="sk-..."
+if [ -f .env ]; then
+    set -a; source .env; set +a
+fi
 if [ -z "${OPENAI_API_KEY:-}" ]; then
     echo "WARNING: OPENAI_API_KEY not set — Judge LLM will fall back to heuristic."
-    echo "         Set it to use the frozen GPT-4o evaluator as described in the paper."
+    echo "         Set it to use the frozen evaluator as described in the paper."
 fi
 
 NUM_GPUS=8

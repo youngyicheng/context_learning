@@ -59,8 +59,8 @@ def parse_args():
                     help="Use frozen LLM as Judge (default: True, requires OPENAI_API_KEY)")
     p.add_argument("--no-llm-judge", dest="use_llm_judge", action="store_false",
                     help="Disable LLM Judge, use heuristic fallback")
-    p.add_argument("--judge-model", type=str, default="gpt-4o",
-                    help="Judge model name (default: gpt-4o)")
+    p.add_argument("--judge-model", type=str, default="gpt-4o-mini",
+                    help="Judge model name (default: gpt-4o-mini)")
     p.add_argument("--openai-api-key", type=str, default=None,
                     help="OpenAI API key (or set OPENAI_API_KEY env var)")
 

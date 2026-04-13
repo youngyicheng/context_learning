@@ -91,7 +91,7 @@ from clbench_rl.rewards.rubrics_reward import RubricsReward
 
 reward_fn = RubricsReward(
     use_llm_judge=True,
-    judge_model="gpt-4o",
+    judge_model="gpt-4o-mini",
     api_client=OpenAI(),
 )
 ```

@@ -30,7 +30,7 @@ def get_default_config() -> Dict[str, Any]:
         },
         "reward": {
             "use_llm_judge": True,
-            "judge_model": "gpt-4o",
+            "judge_model": "gpt-4o-mini",
             "judge_temperature": 0.1,
             # Challenger reward weights w1..w5 (paper: dynamic hyperparameters)
             "w1_adversarial": 1.0,

@@ -13,6 +13,7 @@ from ..data.loader import CLBenchDataLoader
 from ..env.clbench_env import CLBenchEnv
 from ..models.challenge_model import ChallengeModel
 from ..models.solver_model import SolverModel
+from ..utils.metrics_logger import MetricsLogger
 from ..rewards.rubrics_reward import RubricsReward
 
 logger = logging.getLogger(__name__)
@@ -99,7 +100,7 @@ class ReinforceTrainer:
 
         return RubricsReward(
             use_llm_judge=use_llm,
-            judge_model=rw.get("judge_model", "gpt-4o"),
+            judge_model=rw.get("judge_model", "gpt-4o-mini"),
             judge_temperature=rw.get("judge_temperature", 0.1),
             api_client=client,
             w1_adversarial=rw.get("w1_adversarial", 1.0),
@@ -181,6 +182,9 @@ class ReinforceTrainer:
         n = 0
         samples = list(loader)
 
+        metrics_path = Path(train_cfg.get("checkpoint_dir", "checkpoints")) / "metrics.jsonl"
+        ml = MetricsLogger(metrics_path, flush_every=max(1, log_every))
+
         batches = self._chunk_samples(samples, self.repetition_batch_size)
         flat_idx = 0
         iterator = tqdm(total=len(samples), desc="Training")
@@ -223,6 +227,20 @@ class ReinforceTrainer:
                         r_adv=round(total_r_adv / n, 4),
                         r_rep=round(total_r_rep / n, 4),
                     )
+                    ml.log(
+                        step=flat_idx,
+                        solver_reward=r_s,
+                        challenge_reward=r_c,
+                        j_score=s_bd.correctness if s_bd else 0.0,
+                        r_adv=c_bd.adversarial if c_bd else 0.0,
+                        r_rep=c_bd.repetition_penalty if c_bd else 0.0,
+                        r_fmt=c_bd.format_penalty if c_bd else 0.0,
+                        r_rel=c_bd.relevance if c_bd else 0.0,
+                        r_rubric=c_bd.rubric_quality if c_bd else 0.0,
+                        avg_j_score=total_j_score / n,
+                        avg_solver_reward=total_solver_r / n,
+                        avg_challenge_reward=total_challenge_r / n,
+                    )
 
                 if save_every and flat_idx % save_every == 0:
                     self._save_checkpoint(flat_idx)
@@ -240,7 +258,10 @@ class ReinforceTrainer:
             "mean_r_rubric": total_r_rubric / n if n else 0.0,
             "num_episodes": n,
         }
+        ml.close()
+        logger.info("Metrics saved to %s", metrics_path)
         logger.info("Training complete. Metrics: %s", metrics)
+        metrics["metrics_file"] = str(metrics_path)
         return metrics
 
     @staticmethod

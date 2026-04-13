@@ -29,6 +29,7 @@ from tqdm import tqdm
 from ..config.default_config import merge_config
 from ..data.loader import CLBenchDataLoader
 from ..models.challenge_model import ChallengeModel
+from ..utils.metrics_logger import MetricsLogger
 from ..models.solver_model import SolverModel
 from ..rewards.base_reward import SolverRewardResult
 from ..rewards.rubrics_reward import RubricsReward
@@ -152,7 +153,7 @@ class GRPOTrainer:
 
         return RubricsReward(
             use_llm_judge=use_llm,
-            judge_model=rw.get("judge_model", "gpt-4o"),
+            judge_model=rw.get("judge_model", "gpt-4o-mini"),
             judge_temperature=rw.get("judge_temperature", 0.1),
             api_client=client,
             w1_adversarial=rw.get("w1_adversarial", 1.0),
@@ -335,6 +336,9 @@ class GRPOTrainer:
         total_correctness = 0.0
         n_updates = 0
 
+        metrics_path = self.checkpoint_dir / "metrics.jsonl"
+        ml = MetricsLogger(metrics_path, flush_every=max(1, log_every))
+
         for epoch in range(epochs):
             iterator = tqdm(samples, desc=f"GRPO Epoch {epoch + 1}/{epochs}")
 
@@ -410,6 +414,17 @@ class GRPOTrainer:
                         reward=round(total_reward / n_updates, 4),
                         correct=round(total_correctness / n_updates, 4),
                     )
+                    ml.log(
+                        step=global_step, epoch=epoch,
+                        total_loss=step_metrics.get("total_loss", 0.0) if step_metrics else 0.0,
+                        policy_loss=step_metrics.get("policy_loss", 0.0) if step_metrics else 0.0,
+                        kl_penalty=step_metrics.get("kl_penalty", 0.0) if step_metrics else 0.0,
+                        mean_reward=step_metrics.get("mean_reward", 0.0) if step_metrics else 0.0,
+                        correctness=avg_correctness,
+                        avg_loss=total_loss / n_updates,
+                        avg_reward=total_reward / n_updates,
+                        avg_correctness=total_correctness / n_updates,
+                    )
 
                 # --- Checkpoint ---
                 if save_every and global_step % save_every == 0:
@@ -424,9 +439,12 @@ class GRPOTrainer:
             "global_steps": global_step,
             "epochs": epochs,
         }
+        ml.close()
+        logger.info("Metrics saved to %s", metrics_path)
         logger.info("GRPO training complete. Metrics: %s", final_metrics)
 
         self._save_checkpoint(global_step)
+        final_metrics["metrics_file"] = str(metrics_path)
         return final_metrics
 
     # -------------------------------------------------------------------

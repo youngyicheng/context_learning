@@ -22,6 +22,7 @@ import math
 import os
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,13 +32,27 @@ from .base_reward import BaseReward, ChallengeRewardResult, SolverRewardResult
 logger = logging.getLogger(__name__)
 
 
+def _load_dotenv() -> None:
+    """Best-effort load of .env file in project root (no extra dependency)."""
+    for candidate in (Path.cwd() / ".env", Path(__file__).resolve().parents[2] / ".env"):
+        if candidate.is_file():
+            for line in candidate.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    os.environ.setdefault(k.strip(), v.strip())
+            break
+
+
 def build_judge_api_client(api_key: Optional[str] = None):
     """Build an OpenAI-compatible API client for the frozen Judge LLM.
 
-    Reads ``OPENAI_API_KEY`` from the environment if *api_key* is not
-    provided.  Returns ``None`` (with a warning) when no key is available,
-    so the system falls back to heuristic grading.
+    Reads ``OPENAI_API_KEY`` from the environment (or ``.env`` file) if
+    *api_key* is not provided.  Returns ``None`` (with a warning) when no
+    key is available, so the system falls back to heuristic grading.
     """
+    if not api_key and not os.environ.get("OPENAI_API_KEY"):
+        _load_dotenv()
     key = api_key or os.environ.get("OPENAI_API_KEY")
     if not key:
         logger.warning(
@@ -446,7 +461,7 @@ class RubricsReward(BaseReward):
     def __init__(
         self,
         use_llm_judge: bool = False,
-        judge_model: str = "gpt-4o",
+        judge_model: str = "gpt-4o-mini",
         judge_temperature: float = 0.1,
         api_client=None,
         # Challenger reward weights (default / static fallback)

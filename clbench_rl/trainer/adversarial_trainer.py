@@ -30,6 +30,7 @@ from ..models.challenge_model import ChallengeModel, parse_challenger_output
 from ..models.solver_model import SolverModel
 from ..rewards.base_reward import ChallengeRewardResult, SolverRewardResult
 from ..rewards.rubrics_reward import DynamicWeightScheduler, RubricsReward
+from ..utils.metrics_logger import MetricsLogger
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +154,7 @@ class AdversarialTrainer:
 
         return RubricsReward(
             use_llm_judge=use_llm,
-            judge_model=rw.get("judge_model", "gpt-4o"),
+            judge_model=rw.get("judge_model", "gpt-4o-mini"),
             judge_temperature=rw.get("judge_temperature", 0.1),
             api_client=client,
             w1_adversarial=rw.get("w1_adversarial", 1.0),
@@ -282,6 +283,9 @@ class AdversarialTrainer:
             "solver_loss": 0.0, "challenger_loss": 0.0,
         }
         n = 0
+
+        metrics_path = Path(train_cfg.get("checkpoint_dir", "checkpoints")) / "metrics.jsonl"
+        ml = MetricsLogger(metrics_path, flush_every=max(1, log_every))
 
         for epoch in range(epochs):
             iterator = tqdm(samples, desc=f"Epoch {epoch+1}/{epochs}")
@@ -443,6 +447,21 @@ class AdversarialTrainer:
                         c_loss=round(acc["challenger_loss"] / n, 4),
                         c_r=round(acc["challenger_reward"] / n, 4),
                     )
+                    ml.log(
+                        step=global_step, epoch=epoch,
+                        j_score=mean_j,
+                        solver_reward=sum(s_rewards) / max(len(s_rewards), 1),
+                        challenger_reward=sum(c_rewards) / max(len(c_rewards), 1),
+                        solver_loss=s_metrics.get("total_loss", 0.0),
+                        challenger_loss=c_metrics.get("total_loss", 0.0),
+                        solver_policy_loss=s_metrics.get("policy_loss", 0.0),
+                        challenger_policy_loss=c_metrics.get("policy_loss", 0.0),
+                        solver_kl=s_metrics.get("kl_penalty", 0.0),
+                        challenger_kl=c_metrics.get("kl_penalty", 0.0),
+                        avg_j_score=acc["j_score"] / n,
+                        avg_solver_reward=acc["solver_reward"] / n,
+                        avg_challenger_reward=acc["challenger_reward"] / n,
+                    )
 
                 if save_every and global_step % save_every == 0:
                     self._save_checkpoint(global_step)
@@ -454,9 +473,12 @@ class AdversarialTrainer:
             batch_questions = batch_questions[-self.rep_batch_size * 4:]
 
         self._save_checkpoint(global_step)
+        ml.close()
+        logger.info("Metrics saved to %s", metrics_path)
 
         return {k: v / max(n, 1) for k, v in acc.items()} | {
             "global_steps": global_step, "epochs": epochs,
+            "metrics_file": str(metrics_path),
         }
 
     # ------------------------------------------------------------------

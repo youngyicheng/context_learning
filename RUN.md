@@ -1,6 +1,9 @@
-# 如何运行 CL-bench RL
+# CL-bench RL 运行指南（多卡版本）
 
-本文说明从环境准备到各类训练/试跑命令的**完整运行方式**。默认基座模型为 **`Qwen/Qwen3-4B-Instruct-2507`**（可在命令行或配置中覆盖）。Qwen3 需 **transformers≥4.51**，见 `requirements.txt`。
+**本文档以单机多 GPU 正式训练为主路径**（推荐 **8×GPU**，通过 DeepSpeed / `torchrun` 启动）。单卡、小样本仅用于**冒烟测试与调试**；生产实验请按下方「多卡对抗训练」一节执行。
+
+- **默认基座模型**：`Qwen/Qwen3-4B-Instruct-2507`（可覆盖）。Qwen3 需 **transformers≥4.51**，见 `requirements.txt`。
+- **Judge**：冻结评测 LLM，默认 **`gpt-4o-mini`**（OpenAI API）。密钥放在 **`.env`** 的 `OPENAI_API_KEY=`或环境变量中（`.env` 已 gitignore，勿提交仓库）。
 
 ---
 
@@ -9,16 +12,14 @@
 | 项目 | 说明 |
 |------|------|
 | Python | 建议 3.10+ |
-| PyTorch | 2.x；训练/推理建议有 **NVIDIA GPU** 与足够显存 |
-| 网络 | 首次运行需从 Hugging Face 下载数据集 `tencent/CL-bench` 与模型权重 |
-| Hugging Face | 若数据集或模型需登录，先执行 `huggingface-cli login` |
-| Judge（可选但推荐） | 论文设定为**冻结评测 LLM**；默认通过 **OpenAI API** 调用（如 `gpt-4o`）。需配置 `OPENAI_API_KEY`，否则奖励中的 Judge 项会**退化为启发式** |
+| GPU | **多卡训练**：单机多卡 NVIDIA GPU（脚本默认8 卡）；需安装对应 CUDA 的 PyTorch |
+| 网络 | 首次需从 Hugging Face 拉取 `tencent/CL-bench` 与模型权重 |
+| Hugging Face | 需登录时：`huggingface-cli login` |
+| OpenAI | Judge 调用需有效 API Key；无 Key 时 Judge 退化为启发式 |
 
 ---
 
-## 2. 安装依赖
-
-在**仓库根目录**（含 `clbench_rl/`、`scripts/` 的目录）执行：
+## 2. 安装（仓库根目录）
 
 ```bash
 python -m venv .venv
@@ -26,117 +27,57 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-论文附录中与 **BLEU + 层次聚类重复惩罚**相关的功能，建议安装：
+可选（论文附录 BLEU + 聚类重复惩罚更完整）：
 
 ```bash
 pip install nltk scikit-learn
 ```
 
-未安装时，重复惩罚等会退化为近似实现。
-
 ---
 
-## 3. 环境变量（重要）
+## 3. 多卡训练前必配
 
-### 3.1 OpenAI Judge（与 `reward.use_llm_judge=True` 配合）
+### 3.1 Judge API（`.env` 推荐）
 
-训练脚本默认希望使用 **LLM Judge**。任选其一即可：
-
-```bash
-export OPENAI_API_KEY="sk-..."     # 推荐：写入 shell 配置，勿提交到 Git
-```
-
-或在运行 `scripts/train_adversarial.py` 时传入：
+在仓库根目录创建 `.env`（勿提交 Git）：
 
 ```bash
-python scripts/train_adversarial.py --openai-api-key "sk-..."
+OPENAI_API_KEY=sk-...
 ```
 
-### 3.2 其他常用变量
+`scripts/launch_8gpu.sh` 会自动 `source .env`；直接跑 Python 时，`build_judge_api_client()` 也会尝试加载根目录 `.env`。
 
-```bash
-export HF_HOME=~/.cache/huggingface   # 可选：缓存目录
-export TOKENIZERS_PARALLELISM=false  # 多进程时减少 tokenizer 警告
-```
-
-启动脚本 `scripts/launch_8gpu.sh` 内还会设置 `NCCL_*` 等分布式相关变量。
-
----
-
-## 4. 运行方式概览
-
-| 目的 | 入口 | 说明 |
-|------|------|------|
-| 不加载大模型，只测数据与奖励 | `run_pipeline.py --dry-run` | 最快自检 |
-| Rollout + 指标（`ReinforceTrainer`） | `run_pipeline.py` | 小样本试跑流水线 |
-| **论文主流程：Solver + Challenger 双 GRPO** | `train_adversarial.py` | 对抗自博弈训练 |
-
-下面分节给出具体命令。
-
----
-
-## 5. 快速验证（不加载本地大模型）
-
-只拉取少量数据并跑奖励逻辑，用于确认数据集与依赖正常：
-
-```bash
-python scripts/run_pipeline.py --dry-run --max-samples 5
-```
-
----
-
-## 6. 流水线试跑：`run_pipeline.py`
-
-加载 **同一 Hugging Face 模型** 作为 Challenger 与 Solver，做环境一步、生成与奖励统计（适合小样本调试）：
-
-```bash
-python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen3-4B-Instruct-2507
-```
-
-常用参数：
-
-| 参数 | 含义 |
-|------|------|
-| `--max-samples` | 最多处理样本数 |
-| `--model` | 双端共用的模型名 |
-| `--checkpoint-dir` | checkpoint 目录 |
-| `--dry-run` | 不加载模型，仅测数据与奖励 |
-
----
-
-## 7. 对抗训练（主流程）：`train_adversarial.py`
-
-对应 **Self-Evolving ICL / 非对称对抗**设定下的 **Solver + Challenger 双端 GRPO**。未传参时，多数超参与 `clbench_rl/config/default_config.py` 中 `get_default_config()` 一致；命令行会覆盖其中对应项。
-
-### 7.1 单机单进程试跑（建议先限制样本）
-
-```bash
-export OPENAI_API_KEY="sk-..."   # 若要用真实 Judge
-
-python scripts/train_adversarial.py \
-  --max-samples 32 \
-  --epochs 1 \
-  --checkpoint-dir checkpoints/adversarial_smoke
-```
-
-### 7.2 单机多卡：`torchrun`
-
-```bash
-torchrun --nproc_per_node=8 scripts/train_adversarial.py \
-  --max-samples 100 \
-  --epochs 1
-```
-
-（实际是否多卡数据并行取决于当前 `AdversarialTrainer` 是否接入 DDP；多进程前请先确认显存与进程数。）
-
-### 7.3 DeepSpeed 启动脚本（8 GPU）
+或临时导出：
 
 ```bash
 export OPENAI_API_KEY="sk-..."
+```
+
+也可：`python scripts/train_adversarial.py --openai-api-key "sk-..."`
+
+### 3.2 分布式 / 稳定性
+
+```bash
+export TOKENIZERS_PARALLELISM=false
+# 可选
+export HF_HOME=~/.cache/huggingface
+```
+
+`launch_8gpu.sh` 内已设置 `NCCL_*` 等，可按集群情况调整。
+
+---
+
+## 4. 多卡主流程：对抗训练（论文对齐）
+
+**入口**：`scripts/train_adversarial.py`（Solver + Challenger 双端 GRPO）。
+
+### 4.1 推荐：DeepSpeed 8 卡（`launch_8gpu.sh`）
+
+```bash
 bash scripts/launch_8gpu.sh
 ```
 
-可通过环境变量改默认模型与超参，例如：
+默认：`deepspeed --num_gpus=8` + 环境变量中的 `MODEL`、`EPOCHS`、`SOLVER_LR`、`CHALLENGER_LR` 等。覆盖示例：
 
 ```bash
 export MODEL=Qwen/Qwen2.5-7B-Instruct
@@ -144,44 +85,117 @@ export EPOCHS=2
 bash scripts/launch_8gpu.sh -- --max-samples 200
 ```
 
-`launch_8gpu.sh` 末尾的 `"$@"` 会传给 `train_adversarial.py`。
+末尾 `"$@"` 会原样传给 `train_adversarial.py`。
 
-### 7.4 Hugging Face Accelerate + DeepSpeed
+### 4.2 备选：`torchrun`（无 DeepSpeed）
+
+```bash
+bash scripts/launch_torchrun.sh -- --epochs 1 --max-samples 100
+```
+
+`NUM_GPUS` 默认 8，可按机器修改脚本或：
+
+```bash
+NUM_GPUS=4 bash scripts/launch_torchrun.sh -- --max-samples 50
+```
+
+### 4.3备选：Accelerate + DeepSpeed
 
 ```bash
 accelerate launch --config_file configs/accelerate_config.yaml scripts/train_adversarial.py
 ```
 
-DeepSpeed 配置见 `configs/ds_config_zero2.json`、`configs/ds_config_zero3.json`。
+ZeRO 配置：`configs/ds_config_zero2.json` / `ds_config_zero3.json`。
 
-### 7.5 `train_adversarial.py` 常用参数
+### 4.4 多卡注意事项
 
-| 参数 | 含义 |
-|------|------|
-| `--model` | Challenger / Solver 共用基座（默认 Qwen3-4B） |
-| `--solver-model` / `--challenger-model` | 分别覆盖两端模型 |
-| `--epochs` | 训练轮数 |
-| `--lr` | Solver 学习率 |
-| `--challenger-lr` | Challenger 学习率 |
-| `--group-size` | GRPO 组大小 G |
-| `--kl-beta` / `--clip-eps` | KL 与裁剪系数 |
-| `--max-samples` | 限制样本数；不传则按配置使用全量或默认 |
-| `--data-split` | 数据集 split，如 `train` |
-| `--checkpoint-dir` | checkpoint 保存目录 |
-| `--save-every` / `--log-every` / `--ref-sync-every` | 保存、日志、参考模型同步步频 |
-| `--no-llm-judge` | 关闭 API Judge，仅用启发式 |
-| `--judge-model` | Judge 模型名（默认 `gpt-4o`） |
-| `--output-dir` | 训练结束后写入 `final_metrics.json` 的目录 |
+当前 `AdversarialTrainer` 的 DDP/数据并行与 DeepSpeed 的完整集成以你本地环境为准；若多进程各加载一份完整模型，请注意显存。不确定时先用 **单进程小样本**（下一节）验证逻辑，再上多卡。
 
 ---
 
-## 8. 仅用 Python 调用 Trainer（高级）
+## 5. 单卡 / 单进程（仅调试用）
 
-在任意工作目录，将仓库根目录加入 `PYTHONPATH` 或先 `pip install -e .`（若已配置），然后：
+不用于正式多卡实验，仅快速验证数据、Judge、保存路径：
+
+```bash
+python scripts/train_adversarial.py \
+  --max-samples 32 \
+  --epochs 1 \
+  --checkpoint-dir checkpoints/adversarial_smoke
+```
+
+---
+
+## 6. `train_adversarial.py` 常用参数
+
+| 参数 | 含义 |
+|------|------|
+| `--model` | Challenger / Solver 共用基座 |
+| `--solver-model` / `--challenger-model` | 分别指定两端模型 |
+| `--epochs` | 训练轮数 |
+| `--lr` / `--challenger-lr` | Solver / Challenger 学习率 |
+| `--group-size` | GRPO 组大小 G |
+| `--kl-beta` / `--clip-eps` | KL、裁剪 |
+| `--max-samples` | 限制样本数 |
+| `--data-split` | 如 `train` |
+| `--checkpoint-dir` | checkpoint 目录 |
+| `--save-every` / `--log-every` / `--ref-sync-every` | 保存、日志、参考模型同步 |
+| `--no-llm-judge` | 关闭 API Judge |
+| `--judge-model` | 默认 `gpt-4o-mini` |
+| `--output-dir` | 训练结束写入 `final_metrics.json`（默认 `outputs/`） |
+
+默认配置合并自 `clbench_rl/config/default_config.py`。
+
+---
+
+## 7. 训练曲线与最终结果可视化
+
+训练过程会往 **`{checkpoint_dir}/metrics.jsonl`** 追加指标（见各 Trainer 实现）。
+
+生成图：
+
+```bash
+python scripts/plot_metrics.py checkpoints/metrics.jsonl --out figures/
+python scripts/plot_metrics.py outputs/final_metrics.json --out figures/
+```
+
+多实验对比：
+
+```bash
+python scripts/plot_metrics.py run_a/metrics.jsonl run_b/metrics.jsonl --labels "a" "b" --out figures/
+```
+
+---
+
+## 8. 快速自检（不加载大模型）
+
+```bash
+python scripts/run_pipeline.py --dry-run --max-samples 5
+```
+
+---
+
+## 9. 流水线试跑：`run_pipeline.py`（ReinforceTrainer）
+
+小样本 rollout + 指标，非对抗双 GRPO 主路径：
+
+```bash
+python scripts/run_pipeline.py --max-samples 10 --model Qwen/Qwen3-4B-Instruct-2507
+```
+
+| 参数 | 含义 |
+|------|------|
+| `--max-samples` | 最多样本数 |
+| `--model` | 双端共用模型名 |
+| `--checkpoint-dir` | checkpoint |
+| `--dry-run` | 不加载模型 |
+
+---
+
+## 10. Python 直接调用 Trainer（高级）
 
 ```python
 from clbench_rl.config.default_config import merge_config
-from clbench_rl.trainer.grpo_trainer import GRPOTrainer
 from clbench_rl.trainer.adversarial_trainer import AdversarialTrainer
 
 cfg = merge_config({
@@ -189,46 +203,40 @@ cfg = merge_config({
     "training": {"epochs": 1, "checkpoint_dir": "checkpoints"},
     "grpo": {"group_size": 4},
 })
-# GRPOTrainer(cfg).train()           # 仅 Solver 侧 GRPO 示例
-# AdversarialTrainer(cfg).train()    # 双端对抗 GRPO
+AdversarialTrainer(config=cfg).train()
 ```
 
-默认配置键包括：`data`、`challenge_model`、`solver_model`、`reward`、`training`、`grpo`。合并规则见 `merge_config()`（顶层键浅合并，子字典合并覆盖）。
-
 ---
 
-## 9. 输出位置
+## 11. 输出位置
 
-- **Checkpoint**：由 `--checkpoint-dir` / 配置中 `training.checkpoint_dir` 决定（注意 `.gitignore` 可能忽略 `checkpoints/`）。
-- **对抗训练指标**：`train_adversarial.py` 在 `--output-dir`（默认 `outputs/`）下写入 **`final_metrics.json`**。
-
----
-
-## 10. 常见问题
-
-1. **首次运行很慢**  
-   需下载 CL-bench 与 Qwen 权重，属正常现象。
-
-2. **Judge 一直走启发式**  
-   检查是否设置 `OPENAI_API_KEY`，或是否加了 `--no-llm-judge`。
-
-3. **显存不足**  
-   减小 `--max-samples`、`grpo.group_size`，或换更小模型，或使用 ZeRO 配置 / 更小 batch（若你在代码中调整）。
-
-4. **多卡行为**  
-   若未配置分布式，多进程可能各自加载完整模型；调试时建议先用**单进程** `--max-samples` 小规模跑通。
-
----
-
-## 11. 相关文件
-
-| 路径 | 内容 |
+| 内容 | 位置 |
 |------|------|
-| `clbench_rl/config/default_config.py` | 默认超参与模型名 |
-| `scripts/train_adversarial.py` | 对抗训练 CLI |
-| `scripts/run_pipeline.py` | 流水线 CLI |
-| `scripts/launch_8gpu.sh` / `scripts/launch_torchrun.sh` | 多卡启动示例 |
-| `configs/accelerate_config.yaml` | Accelerate + DeepSpeed |
-| `README.md` | 项目简介与其它说明 |
+| Checkpoint | `--checkpoint-dir` / `training.checkpoint_dir` |
+| 逐步指标 | `{checkpoint_dir}/metrics.jsonl` |
+| 训练结束汇总 | `outputs/final_metrics.json`（`--output-dir` 可改） |
+| 图表 | `scripts/plot_metrics.py` 的 `--out`（默认 `figures/`） |
 
-更细节的实现与论文公式对应关系见代码内注释及仓库中的方法说明 PDF（若有）。
+---
+
+## 12. 常见问题
+
+1. **首次很慢**：下载数据集与模型权重正常。  
+2. **Judge 变启发式**：检查 `OPENAI_API_KEY` 与 `.env`。  
+3. **显存不够**：减小 `--max-samples`、`group_size`，或换更小模型、开 ZeRO。  
+4. **多卡异常**：先单进程小样本跑通，再开多卡；检查 `CUDA_VISIBLE_DEVICES`、端口 `MASTER_PORT` 是否冲突。
+
+---
+
+## 13. 相关文件
+
+| 路径 | 说明 |
+|------|------|
+| `scripts/launch_8gpu.sh` | **多卡主入口**（DeepSpeed 8 GPU） |
+| `scripts/launch_torchrun.sh` | 多卡 `torchrun` |
+| `scripts/train_adversarial.py` | 对抗训练 CLI |
+| `scripts/plot_metrics.py` | 指标可视化 |
+| `configs/accelerate_config.yaml` | Accelerate + DeepSpeed |
+| `clbench_rl/config/default_config.py` | 默认超参 |
+
+更多项目背景见 `README.md`。
