@@ -206,8 +206,6 @@ class AdversarialTrainer:
         G = len(group.responses)
         input_ids = group.input_ids.to(device)
 
-        model.enable_gradient_checkpointing()
-
         for _ in range(self.mu_iterations):
             model.model.train()
 
@@ -267,7 +265,6 @@ class AdversarialTrainer:
                 "total_loss": (sum_policy + self.kl_beta * sum_kl) / n,
             }
 
-        model.model.gradient_checkpointing_disable()
         model.model.eval()
         return metrics
 
