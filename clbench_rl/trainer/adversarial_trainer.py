@@ -72,6 +72,14 @@ class AdversarialTrainer:
 
         self.solver_ref = self._build_reference(self.solver)
         self.challenger_ref = self._build_reference_challenger(self.challenger)
+
+        # Keep ref models on CPU to save ~8 GB per GPU;
+        # they are moved to GPU briefly inside _do_grpo_update.
+        self.solver_ref.model.to("cpu")
+        self.challenger_ref.model.to("cpu")
+        torch.cuda.empty_cache()
+        logger.info("Reference models offloaded to CPU")
+
         self.reward_fn = self._build_reward()
 
         train_cfg = self.cfg.get("training", {})
@@ -200,29 +208,34 @@ class AdversarialTrainer:
         return ((t - t.mean()) / (t.std() + eps)).tolist()
 
     def _do_grpo_update(self, model, ref_model, optimizer, group: GroupResult):
-        """Per-trajectory GRPO: only one computation graph alive at a time."""
+        """Per-trajectory GRPO with ref-model CPU offloading.
+
+        Phase 1: bring ref model to GPU, compute ref logprobs, send it back.
+        Phase 2: per-trajectory forward + immediate backward (no gradient
+                 checkpointing needed — only 1 graph alive at a time, and
+                 ref is off GPU so there's ~8 GB extra room).
+        """
         metrics: Dict[str, float] = {}
         device = model.model.device
         G = len(group.responses)
         input_ids = group.input_ids.to(device)
 
-        model.enable_gradient_checkpointing()
+        # ------ Phase 1: ref logprobs (ref briefly on GPU) ------
+        ref_model.model.to(device)
+        ref_lps: List[Optional[torch.Tensor]] = []
+        for i in range(G):
+            gen_ids = group.generated_ids_list[i].to(device)
+            if gen_ids.numel() == 0:
+                ref_lps.append(None)
+                continue
+            lp = ref_model.compute_per_token_logprobs_detached(input_ids, gen_ids)
+            ref_lps.append(lp.cpu())
+        ref_model.model.to("cpu")
+        torch.cuda.empty_cache()
 
+        # ------ Phase 2: GRPO mu-iterations (ref off GPU) ------
         for _ in range(self.mu_iterations):
             model.model.train()
-
-            # Phase 1: pre-compute ref logprobs (frozen, no graph)
-            ref_lps: List[Optional[torch.Tensor]] = []
-            for i in range(G):
-                gen_ids = group.generated_ids_list[i].to(device)
-                if gen_ids.numel() == 0:
-                    ref_lps.append(None)
-                    continue
-                ref_lps.append(
-                    ref_model.compute_per_token_logprobs_detached(input_ids, gen_ids)
-                )
-
-            # Phase 2: per-trajectory forward + immediate backward
             optimizer.zero_grad()
             n_valid = 0
             sum_policy = 0.0
@@ -245,7 +258,7 @@ class AdversarialTrainer:
                     ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps
                 ) * adv
                 p_loss_i = -torch.min(surr1, surr2).mean()
-                kl_i = (cur_lp - ref_lps[i]).mean()
+                kl_i = (cur_lp - ref_lps[i].to(device)).mean()
 
                 loss_i = (p_loss_i + self.kl_beta * kl_i) / max(G, 1)
                 loss_i.backward()
@@ -267,7 +280,6 @@ class AdversarialTrainer:
                 "total_loss": (sum_policy + self.kl_beta * sum_kl) / n,
             }
 
-        model.model.gradient_checkpointing_disable()
         model.model.eval()
         return metrics
 
@@ -646,6 +658,8 @@ class AdversarialTrainer:
         logger.info("Checkpoint saved at step %d", step)
 
     def _sync_references(self) -> None:
-        self.solver_ref.model.load_state_dict(self.solver.model.state_dict())
-        self.challenger_ref.model.load_state_dict(self.challenger.model.state_dict())
-        logger.info("Reference models synced.")
+        cpu_sd = {k: v.cpu() for k, v in self.solver.model.state_dict().items()}
+        self.solver_ref.model.load_state_dict(cpu_sd)
+        cpu_sd = {k: v.cpu() for k, v in self.challenger.model.state_dict().items()}
+        self.challenger_ref.model.load_state_dict(cpu_sd)
+        logger.info("Reference models synced (on CPU).")
