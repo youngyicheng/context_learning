@@ -103,7 +103,7 @@ class ChallengeModel:
 
     def enable_gradient_checkpointing(self):
         self.model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
+            gradient_checkpointing_kwargs={"use_reentrant": True}
         )
 
     def generate(
