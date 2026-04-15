@@ -70,9 +70,6 @@ class AdversarialTrainer:
         self.solver = self._build_solver()
         self.challenger = self._build_challenger()
 
-        self.solver.enable_gradient_checkpointing()
-        self.challenger.enable_gradient_checkpointing()
-
         self.solver_ref = self._build_reference(self.solver)
         self.challenger_ref = self._build_reference_challenger(self.challenger)
         self.reward_fn = self._build_reward()
@@ -209,6 +206,8 @@ class AdversarialTrainer:
         G = len(group.responses)
         input_ids = group.input_ids.to(device)
 
+        model.enable_gradient_checkpointing()
+
         for _ in range(self.mu_iterations):
             model.model.train()
 
@@ -267,6 +266,9 @@ class AdversarialTrainer:
                 "kl": sum_kl / n,
                 "total_loss": (sum_policy + self.kl_beta * sum_kl) / n,
             }
+
+        model.model.gradient_checkpointing_disable()
+        model.model.eval()
         return metrics
 
     # ------------------------------------------------------------------
