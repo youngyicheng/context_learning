@@ -78,6 +78,16 @@ def get_default_config() -> Dict[str, Any]:
             "colocate_models": True,
             # Max parallel judge-API calls per step. None → group_size.
             "judge_concurrency": None,
+            # Activation-memory saver for the GRPO forward pass. Turned on
+            # around _do_grpo_update only, so `generate()` stays fast.
+            "gradient_checkpointing": True,
+            # Fixed held-out test set: last N samples of the (seed-shuffled)
+            # full split, never seen during training.
+            "test_size": 100,
+            "test_seed": 42,
+            "run_eval": True,
+            # 0 → reuse solver_model.max_new_tokens for eval-time decoding.
+            "eval_max_new_tokens": 0,
         },
         "grpo": {
             # Lower G reduces batched GRPO / generate peak VRAM (try 4 if memory allows).

@@ -70,6 +70,49 @@ class SolverModel:
         if self.use_lora:
             self._apply_lora(self.lora_cfg)
 
+        self._gc_enabled = False
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Turn on gradient checkpointing for the training forward pass.
+
+        Uses `use_reentrant=False` (HuggingFace recommended with PEFT/LoRA) to
+        avoid the Qwen3 RoPE / reentrant autograd issues that produced
+        `illegal memory access` in earlier runs. Also enables input grads so
+        the LoRA-frozen base embedding still propagates gradients to the
+        LoRA adapters when checkpointing is active.
+
+        This is intentionally idempotent and cheap — toggling it per-step
+        around the GRPO forward is a supported usage pattern.
+        """
+        if self._gc_enabled:
+            return
+        base = self.model
+        try:
+            base.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            base.gradient_checkpointing_enable()
+        if hasattr(base, "enable_input_require_grads"):
+            base.enable_input_require_grads()
+        if hasattr(base, "config"):
+            base.config.use_cache = False
+        self._gc_enabled = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Turn gradient checkpointing back off (required before `generate()`,
+        which relies on KV-cache = `use_cache=True`)."""
+        if not self._gc_enabled:
+            return
+        base = self.model
+        try:
+            base.gradient_checkpointing_disable()
+        except Exception:
+            pass
+        if hasattr(base, "config"):
+            base.config.use_cache = True
+        self._gc_enabled = False
+
     def _apply_lora(self, cfg: Dict[str, Any]) -> None:
         """Wrap `self.model` with a PEFT LoRA adapter.
 

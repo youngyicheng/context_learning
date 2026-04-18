@@ -126,6 +126,38 @@ class ChallengeModel:
         if self.use_lora:
             self._apply_lora(self.lora_cfg)
 
+        self._gc_enabled = False
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Activate gradient checkpointing (see SolverModel for rationale)."""
+        if self._gc_enabled:
+            return
+        base = self.model
+        try:
+            base.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            base.gradient_checkpointing_enable()
+        if hasattr(base, "enable_input_require_grads"):
+            base.enable_input_require_grads()
+        if hasattr(base, "config"):
+            base.config.use_cache = False
+        self._gc_enabled = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Restore KV-cache-friendly mode for the next `generate()` call."""
+        if not self._gc_enabled:
+            return
+        base = self.model
+        try:
+            base.gradient_checkpointing_disable()
+        except Exception:
+            pass
+        if hasattr(base, "config"):
+            base.config.use_cache = True
+        self._gc_enabled = False
+
     def _apply_lora(self, cfg: Dict[str, Any]) -> None:
         from peft import LoraConfig, TaskType, get_peft_model
 

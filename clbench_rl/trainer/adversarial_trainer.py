@@ -127,6 +127,18 @@ class AdversarialTrainer:
         jc = train_cfg.get("judge_concurrency")
         self.judge_concurrency = int(jc) if jc else max(self.group_size, 1)
 
+        # Gradient checkpointing (training forward only). We toggle it around
+        # `_do_grpo_update`, so `generate()` keeps its KV cache for speed.
+        self.use_grad_ckpt = bool(train_cfg.get("gradient_checkpointing", True))
+
+        # Fixed train/test split controls.
+        self.test_size = int(train_cfg.get("test_size", 100) or 0)
+        self.test_seed = int(train_cfg.get("test_seed", 42))
+        self.run_eval = bool(train_cfg.get("run_eval", True))
+        self.eval_max_new_tokens = int(
+            train_cfg.get("eval_max_new_tokens", 0) or 0
+        )
+
     # ------------------------------------------------------------------
     # Distributed init & device assignment
     # ------------------------------------------------------------------
@@ -386,54 +398,66 @@ class AdversarialTrainer:
             torch.cuda.empty_cache()
 
         # ---- Phase 2: GRPO mu-iterations (batched fwd + single bwd) ----
-        for _ in range(self.mu_iterations):
-            model.model.train()
-            optimizer.zero_grad()
+        # Gradient checkpointing cuts activation memory ~2-3× at ~20% extra
+        # compute. Switch on only around the differentiable forward, so the
+        # (KV-cache-dependent) `generate()` calls outside remain fast.
+        gc_active = self.use_grad_ckpt and any(
+            p.requires_grad for p in model.model.parameters()
+        )
+        if gc_active:
+            model.enable_gradient_checkpointing()
+        try:
+            for _ in range(self.mu_iterations):
+                model.model.train()
+                optimizer.zero_grad()
 
-            cur_lps = model.compute_per_token_logprobs_batched(
-                input_ids, valid_gens
-            )
-
-            total_loss: Optional[torch.Tensor] = None
-            sum_policy = 0.0
-            sum_kl = 0.0
-            scale = max(len(valid_idx), 1)
-
-            for k, i in enumerate(valid_idx):
-                cur_lp = cur_lps[k]
-                ref_lp = ref_lps[k].to(device)
-                old_lp = cur_lp.detach()
-
-                ratio = torch.exp(cur_lp - old_lp)
-                adv = torch.tensor(
-                    group.advantages[i], device=device, dtype=torch.float32
+                cur_lps = model.compute_per_token_logprobs_batched(
+                    input_ids, valid_gens
                 )
-                surr1 = ratio * adv
-                surr2 = torch.clamp(
-                    ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps
-                ) * adv
-                p_loss_i = -torch.min(surr1, surr2).mean()
-                kl_i = (cur_lp - ref_lp).mean()
 
-                loss_i = (p_loss_i + self.kl_beta * kl_i) / scale
-                total_loss = loss_i if total_loss is None else total_loss + loss_i
+                total_loss: Optional[torch.Tensor] = None
+                sum_policy = 0.0
+                sum_kl = 0.0
+                scale = max(len(valid_idx), 1)
 
-                sum_policy += p_loss_i.item()
-                sum_kl += kl_i.item()
+                for k, i in enumerate(valid_idx):
+                    cur_lp = cur_lps[k]
+                    ref_lp = ref_lps[k].to(device)
+                    old_lp = cur_lp.detach()
 
-            if total_loss is not None:
-                total_loss.backward()
-                self._allreduce_grads(model.model)
-                torch.nn.utils.clip_grad_norm_(
-                    self._trainable_params(model.model), self.max_grad_norm
-                )
-                optimizer.step()
+                    ratio = torch.exp(cur_lp - old_lp)
+                    adv = torch.tensor(
+                        group.advantages[i], device=device, dtype=torch.float32
+                    )
+                    surr1 = ratio * adv
+                    surr2 = torch.clamp(
+                        ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps
+                    ) * adv
+                    p_loss_i = -torch.min(surr1, surr2).mean()
+                    kl_i = (cur_lp - ref_lp).mean()
 
-            metrics = {
-                "policy_loss": sum_policy / scale,
-                "kl": sum_kl / scale,
-                "total_loss": (sum_policy + self.kl_beta * sum_kl) / scale,
-            }
+                    loss_i = (p_loss_i + self.kl_beta * kl_i) / scale
+                    total_loss = loss_i if total_loss is None else total_loss + loss_i
+
+                    sum_policy += p_loss_i.item()
+                    sum_kl += kl_i.item()
+
+                if total_loss is not None:
+                    total_loss.backward()
+                    self._allreduce_grads(model.model)
+                    torch.nn.utils.clip_grad_norm_(
+                        self._trainable_params(model.model), self.max_grad_norm
+                    )
+                    optimizer.step()
+
+                metrics = {
+                    "policy_loss": sum_policy / scale,
+                    "kl": sum_kl / scale,
+                    "total_loss": (sum_policy + self.kl_beta * sum_kl) / scale,
+                }
+        finally:
+            if gc_active:
+                model.disable_gradient_checkpointing()
 
         model.model.eval()
         return metrics
@@ -490,9 +514,13 @@ class AdversarialTrainer:
           5. Compute solver rewards J_score for each
           6. GRPO update Solver on J_score
         """
+        # Load the full split once (no max_samples here): we slice
+        # train/test deterministically *in Python* so the held-out test set
+        # is invariant to --max-samples.
+        data_cfg = self.cfg.get("data", {})
         loader = CLBenchDataLoader(**{
-            k: v for k, v in self.cfg.get("data", {}).items()
-            if k in ("split", "max_samples", "subset", "cache_dir")
+            k: v for k, v in data_cfg.items()
+            if k in ("split", "subset", "cache_dir")
         })
         loader.load()
 
@@ -525,7 +553,23 @@ class AdversarialTrainer:
         max_ctx_ch = int(train_cfg.get("max_context_chars_challenger", 6000))
         max_ctx_sv = int(train_cfg.get("max_context_chars_solver", 4000))
 
-        samples = list(loader)
+        all_samples = list(loader)
+        train_samples, test_samples = self._split_train_test(
+            all_samples,
+            test_size=self.test_size,
+            seed=self.test_seed,
+            max_train=data_cfg.get("max_samples"),
+        )
+        if is_rank0:
+            logger.info(
+                "Split: %d total → %d train (capped by max_samples=%s) + "
+                "%d test (seed=%d, fixed)",
+                len(all_samples), len(train_samples),
+                data_cfg.get("max_samples"),
+                len(test_samples), self.test_seed,
+            )
+
+        samples = train_samples
         if self._is_distributed():
             full_n = len(samples)
             samples = samples[self.rank::self.world_size]
@@ -852,6 +896,19 @@ class AdversarialTrainer:
         if save_rollouts and is_rank0:
             out["rollout_trace_file"] = str(rollout_jsonl)
 
+        # --------------------------- Evaluation ---------------------------
+        # Only rank 0 runs it (weights are identical across ranks after
+        # all_reduce); other ranks wait at the barrier so they don't exit
+        # the process group prematurely.
+        if self.run_eval and test_samples:
+            if is_rank0:
+                eval_summary = self.evaluate(
+                    test_samples,
+                    tag=f"step_{global_step}",
+                )
+                out["test_summary"] = eval_summary
+            self._barrier()
+
         if self._is_distributed() and dist.is_initialized():
             dist.destroy_process_group()
         return out
@@ -859,6 +916,221 @@ class AdversarialTrainer:
     # ------------------------------------------------------------------
     # Checkpointing & reference sync
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Train / test split + evaluation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_train_test(
+        samples: List[Any],
+        test_size: int,
+        seed: int,
+        max_train: Optional[int] = None,
+    ) -> Tuple[List[Any], List[Any]]:
+        """Deterministic train/test split.
+
+        The test set is defined by a **seed-shuffled permutation of the full
+        split** so that:
+
+          * it is reproducible across runs (same `seed` → same test set);
+          * it is invariant to `max_samples` (capping the training pool never
+            leaks test samples into training);
+          * rank 0 and non-rank-0 workers compute *the same* partition (only
+            rank 0 actually evaluates, but all workers hold the same view).
+        """
+        import random
+
+        if test_size <= 0 or test_size >= len(samples):
+            train = samples[:]
+            test: List[Any] = []
+        else:
+            indices = list(range(len(samples)))
+            random.Random(seed).shuffle(indices)
+            test_idx = sorted(indices[-test_size:])
+            test_set = set(test_idx)
+            test = [samples[i] for i in test_idx]
+            train = [s for i, s in enumerate(samples) if i not in test_set]
+
+        if max_train is not None and max_train > 0:
+            train = train[:max_train]
+        return train, test
+
+    def evaluate(
+        self,
+        test_samples: List[Dict[str, Any]],
+        tag: str = "final",
+    ) -> Dict[str, float]:
+        """Run the trained Solver+Challenger on a fixed held-out test set.
+
+        For each context:
+          1. Challenger generates one (Q, E, R) via low-temperature sampling.
+          2. Solver answers that question on the same (truncated) context.
+          3. Judge scores the answer against the generated rubric, yielding
+             `J_score ∈ [0, 1]`.
+
+        Per-sample records are appended to
+        `<checkpoint_dir>/test_results_<tag>.jsonl`, and the aggregate goes
+        to `<output_dir>/test_summary_<tag>.json` (best effort).
+
+        Called from rank 0 only; safe to call stand-alone after loading a
+        trained adapter as well.
+        """
+        if not self.is_rank0:
+            return {}
+        if not test_samples:
+            logger.info("Evaluation skipped: empty test set.")
+            return {}
+
+        train_cfg = self.cfg.get("training", {})
+        cm_cfg = self.cfg.get("challenge_model", {})
+        sm_cfg = self.cfg.get("solver_model", {})
+
+        max_ctx_ch = int(train_cfg.get("max_context_chars_challenger", 6000))
+        max_ctx_sv = int(train_cfg.get("max_context_chars_solver", 4000))
+        eval_new_tokens = (
+            self.eval_max_new_tokens
+            or int(sm_cfg.get("max_new_tokens", 1024))
+        )
+        ch_new_tokens = int(cm_cfg.get("max_new_tokens", 512))
+
+        results_path = self.checkpoint_dir / f"test_results_{tag}.jsonl"
+        if results_path.exists():
+            results_path.unlink()
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.solver.model.eval()
+        self.challenger.model.eval()
+
+        totals = {
+            "n": 0, "n_parsed": 0,
+            "j_score_sum": 0.0,
+            "challenger_fmt_ok": 0,
+        }
+
+        logger.info(
+            "[Eval] Running held-out evaluation on %d samples → %s",
+            len(test_samples), results_path,
+        )
+
+        iterator = tqdm(test_samples, desc=f"Eval ({tag})", disable=False)
+        for idx, sample in enumerate(iterator):
+            messages = sample.get("messages", [])
+            if not messages:
+                continue
+            context = self._extract_context(messages)
+            ch_context = context[:max_ctx_ch] if max_ctx_ch > 0 else context
+            sv_context = context[:max_ctx_sv] if max_ctx_sv > 0 else context
+            meta = sample.get("metadata", {})
+
+            # 1) Challenger: one low-temp rollout.
+            ch_msgs = self.challenger.build_context_messages(ch_context)
+            try:
+                ch_text = self.challenger.generate(
+                    ch_msgs,
+                    max_new_tokens=ch_new_tokens,
+                    temperature=0.3,
+                    do_sample=True,
+                )
+            except Exception as e:
+                logger.warning("[Eval] Challenger failed on idx=%d: %s", idx, e)
+                continue
+            parsed = parse_challenger_output(ch_text)
+            q_ok = bool(parsed.question)
+            r_ok = bool(parsed.rubric)
+            if q_ok and r_ok:
+                totals["challenger_fmt_ok"] += 1
+                totals["n_parsed"] += 1
+
+            question = parsed.question or ch_text
+            rubrics = (
+                [parsed.rubric] if parsed.rubric
+                else sample.get("rubrics", [])
+            )
+
+            # 2) Solver answer.
+            solver_msgs = [
+                {"role": "system", "content": sv_context},
+                {"role": "user", "content": question},
+            ]
+            try:
+                answer = self.solver.generate(
+                    solver_msgs,
+                    max_new_tokens=eval_new_tokens,
+                    temperature=0.2,
+                    do_sample=True,
+                )
+            except Exception as e:
+                logger.warning("[Eval] Solver failed on idx=%d: %s", idx, e)
+                continue
+
+            # 3) Judge score.
+            try:
+                s_res = self.reward_fn.compute_solver_reward(
+                    answer=answer,
+                    rubrics=rubrics,
+                    context=context,
+                    metadata=meta,
+                )
+                j_score = float(s_res.correctness)
+                s_details = self._json_safe(s_res.details)
+            except Exception as e:
+                logger.warning("[Eval] Judge failed on idx=%d: %s", idx, e)
+                j_score = 0.0
+                s_details = {"error": str(e)}
+
+            totals["n"] += 1
+            totals["j_score_sum"] += j_score
+
+            rec = {
+                "index": idx,
+                "metadata": self._json_safe(meta),
+                "context_preview": self._truncate_text(context, 4000),
+                "challenger_raw": self._truncate_text(ch_text, 8000),
+                "question": parsed.question,
+                "evidence_span": parsed.evidence_span,
+                "rubric": parsed.rubric,
+                "answer": answer,
+                "j_score": j_score,
+                "solver_details": s_details,
+                "challenger_format_ok": bool(q_ok and r_ok),
+            }
+            with open(results_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            if totals["n"] % 10 == 0:
+                iterator.set_postfix(
+                    j=round(totals["j_score_sum"] / max(totals["n"], 1), 4),
+                    fmt=round(totals["challenger_fmt_ok"] / max(totals["n"], 1), 3),
+                )
+
+        n = max(totals["n"], 1)
+        summary = {
+            "tag": tag,
+            "num_samples": totals["n"],
+            "num_challenger_parsed": totals["n_parsed"],
+            "mean_j_score": totals["j_score_sum"] / n,
+            "challenger_format_ok_rate": totals["challenger_fmt_ok"] / n,
+            "results_file": str(results_path),
+        }
+
+        # Best-effort summary dump next to the results file.
+        summary_path = self.checkpoint_dir / f"test_summary_{tag}.json"
+        try:
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2, ensure_ascii=False)
+            summary["summary_file"] = str(summary_path)
+        except Exception as e:
+            logger.warning("[Eval] Could not write summary file: %s", e)
+
+        logger.info(
+            "[Eval] Done: n=%d  mean_J=%.4f  fmt_ok=%.3f  → %s",
+            summary["num_samples"],
+            summary["mean_j_score"],
+            summary["challenger_format_ok_rate"],
+            results_path,
+        )
+        return summary
 
     def _save_checkpoint(self, step: int) -> None:
         for name, model in [("solver", self.solver), ("challenger", self.challenger)]:

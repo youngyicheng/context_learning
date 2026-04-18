@@ -137,6 +137,30 @@ def parse_args():
         help="Max parallel judge API calls per step (default: group_size)",
     )
 
+    p.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
+        help="Disable activation checkpointing (uses more VRAM; default: ON)",
+    )
+    p.add_argument(
+        "--test-size", type=int, default=None,
+        help="Held-out test-set size (fixed across runs; default 100).",
+    )
+    p.add_argument(
+        "--test-seed", type=int, default=None,
+        help="Seed used to deterministically select the test set from the "
+        "full split (default 42). Same seed → same test set across runs.",
+    )
+    p.add_argument(
+        "--no-test-eval", action="store_true",
+        help="Skip the post-training evaluation on the held-out test set.",
+    )
+    p.add_argument(
+        "--eval-max-new-tokens", type=int, default=None,
+        help="Override max_new_tokens at eval time "
+        "(default: reuse solver_model.max_new_tokens).",
+    )
+
     p.add_argument("--use-llm-judge", action="store_true", default=True,
                     help="Use frozen LLM as Judge (default: True, requires OPENAI_API_KEY)")
     p.add_argument("--no-llm-judge", dest="use_llm_judge", action="store_false",
@@ -210,6 +234,20 @@ def main():
             **(
                 {"judge_concurrency": args.judge_concurrency}
                 if args.judge_concurrency is not None else {}
+            ),
+            "gradient_checkpointing": not args.no_gradient_checkpointing,
+            "run_eval": not args.no_test_eval,
+            **(
+                {"test_size": args.test_size}
+                if args.test_size is not None else {}
+            ),
+            **(
+                {"test_seed": args.test_seed}
+                if args.test_seed is not None else {}
+            ),
+            **(
+                {"eval_max_new_tokens": args.eval_max_new_tokens}
+                if args.eval_max_new_tokens is not None else {}
             ),
         },
         "grpo": {
